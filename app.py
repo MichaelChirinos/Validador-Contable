@@ -1,0 +1,79 @@
+import os
+from flask import Flask, request, jsonify
+from thefuzz import process
+from groq import Groq
+
+app = Flask(__name__)
+
+# Configuración de Groq - Render leerá esto de sus "Environment Variables"
+# Localmente puedes usar: os.environ.get("GROQ_API_KEY", "tu_key_de_prueba")
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+def obtener_veredicto_ia(descripcion, cuenta_actual, opciones_reducidas):
+    prompt = f"""
+    Eres un auditor contable experto en SAP Business One.
+    Factura: "{descripcion}"
+    Cuenta actual: {cuenta_actual['AcctCode']} - {cuenta_actual['AcctName']}
+
+    Opciones del catálogo (Top 10 similares):
+    {opciones_reducidas}
+
+    TAREA:
+    1. Verifica si la cuenta actual es la correcta para el producto/servicio.
+    2. Si es una cuenta genérica y existe una específica, sugiere el cambio.
+    3. Responde estrictamente en JSON.
+
+    Formato de salida:
+    {{
+        "es_correcta": true/false,
+        "codigo_sugerido": "XXXXXX",
+        "nombre_sugerido": "XXXXXX",
+        "justificacion": "Explicación breve"
+    }}
+    """
+    
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        return str({"error_ia": str(e)})
+
+@app.route('/auditar', methods=['POST'])
+def auditar():
+    try:
+        data = request.json
+        desc_sql = data.get('descripcion_sql', '')
+        cuenta_actual = data.get('cuenta_actual', {})
+        catalogo = data.get('catalogo', [])
+
+        if not catalogo or not desc_sql:
+            return jsonify({"error": "Faltan datos (catalogo o descripcion)"}), 400
+
+        # --- PASO 1: FUZZY MATCHING (Local en Render, no gasta tokens) ---
+        nombres_cat = [item['AcctName'] for item in catalogo]
+        matches = process.extract(desc_sql, nombres_cat, limit=10)
+        
+        top_10_nombres = [m[0] for m in matches]
+        opciones_reducidas = [item for item in catalogo if item['AcctName'] in top_10_nombres]
+
+        # --- PASO 2: CONSULTA A GROQ ---
+        resultado_ia = obtener_veredicto_ia(desc_sql, cuenta_actual, opciones_reducidas)
+
+        return resultado_ia
+
+    except Exception as e:
+        return jsonify({"error": f"Error en el servidor: {str(e)}"}), 500
+
+# Ruta de prueba para verificar que el servicio está vivo en Render
+@app.route('/')
+def health_check():
+    return "API de Auditoría Contable activa y lista."
+
+if __name__ == '__main__':
+    # Importante para Render: leer el puerto que le asignan
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
