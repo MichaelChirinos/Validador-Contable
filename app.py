@@ -10,22 +10,24 @@ app = Flask(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 def obtener_veredicto_ia(descripcion, cuenta_actual, opciones_reducidas):
-    # Escapar las comillas dobles internas o usar comillas simples para el JSON
     prompt = f'''
 Eres un Auditor de Sistemas Contables experto en SAP Business One. 
 Tu objetivo es detectar inconsistencias entre la descripción de una transacción y la cuenta contable asignada, utilizando el Plan Contable General Empresarial (PCGE).
 
+**CONTEXTO:**
+Los registros que estás auditando corresponden a **facturas de compras**. La descripción que recibes es el concepto de cada ítem o servicio facturado por el proveedor.
+
 DATOS DE ENTRADA:
-- Descripción del Registro: "{descripcion}"
+- Descripción del Ítem: "{descripcion}"
 - Cuenta Asignada Actualmente: {cuenta_actual['AcctCode']} - {cuenta_actual['AcctName']}
 
 CATÁLOGO DE CUENTAS DE DETALLE (Sugerencias similares):
 {opciones_reducidas}
 
 INSTRUCCIONES UNIVERSALES DE VALIDACIÓN:
-1. CONSISTENCIA SEMÁNTICA: Compara la naturaleza del texto (¿Es un producto, un servicio, un impuesto, un movimiento bancario o una provisión?) con la naturaleza de la cuenta asignada.
+1. CONSISTENCIA SEMÁNTICA: Compara la naturaleza del texto (¿Es un producto físico, un servicio, un impuesto, un movimiento bancario o una provisión?) con la naturaleza de la cuenta asignada.
 2. NIVEL DE REGISTRO: Solo son válidas las cuentas de último nivel (detalle). Si la cuenta actual es genérica y existe una específica que nombre el concepto exacto de la descripción, sugiere el cambio.
-3. DETECCIÓN DE "CUENTAS COMODÍN": Si la cuenta actual es una cuenta transitoria o de 'varios' (ej. Facturas por recibir, Cuentas por pagar generales) y en el catálogo aparece la cuenta de destino real (ej. Suministros, Honorarios, Banco específico), márcalo como incorrecto.
+3. DETECCIÓN DE "CUENTAS COMODÍN": Si la cuenta actual es una cuenta transitoria o de 'varios' (ej. FACTURAS POR RECIBIR, CUENTAS POR PAGAR, CUENTAS PUENTE) y en el catálogo aparece la cuenta de destino real que corresponde a la naturaleza del ítem (producto, servicio, activo, etc.), márcalo como incorrecto.
 4. JERARQUÍA DE COINCIDENCIA: Prioriza siempre la cuenta que contenga la mayor cantidad de palabras clave de la descripción en su nombre.
 
 FORMATO DE SALIDA (JSON ESTRICTO):
