@@ -10,31 +10,33 @@ app = Flask(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 def obtener_veredicto_ia(descripcion, cuenta_actual, opciones_reducidas):
-    prompt = f"""
-    Eres un Auditor Senior de SAP Business One experto en el Plan Contable General Empresarial (PCGE).
-    Tu misión es validar si la cuenta contable asignada a una transacción es la correcta o si existe una más específica.
-    
-    DATOS DE LA TRANSACCIÓN:
-    - Glosa/Descripción: "{descripcion}"
-    - Cuenta Asignada Actual: {cuenta_actual['AcctCode']} - {cuenta_actual['AcctName']}
+    # Escapar las comillas dobles internas o usar comillas simples para el JSON
+    prompt = f'''
+Eres un Auditor de Sistemas Contables experto en SAP Business One. 
+Tu objetivo es detectar inconsistencias entre la descripción de una transacción y la cuenta contable asignada, utilizando el Plan Contable General Empresarial (PCGE).
 
-    Opciones del catálogo (Top 10 similares):
-    {opciones_reducidas}
+DATOS DE ENTRADA:
+- Descripción del Registro: "{descripcion}"
+- Cuenta Asignada Actualmente: {cuenta_actual['AcctCode']} - {cuenta_actual['AcctName']}
 
-    TAREA:
-    1. Verifica si la cuenta actual es la correcta para el producto/servicio.
-    2. Si es una cuenta genérica y existe una específica, sugiere el cambio.
-    3. Responde estrictamente en JSON.
+CATÁLOGO DE CUENTAS DE DETALLE (Sugerencias similares):
+{opciones_reducidas}
 
-    Formato de salida:
-    {{
-        "es_correcta": true/false,
-        "codigo_sugerido": "XXXXXX",
-        "nombre_sugerido": "XXXXXX",
-        "justificacion": "Explicación breve"
-    }}
-    """
-    
+INSTRUCCIONES UNIVERSALES DE VALIDACIÓN:
+1. CONSISTENCIA SEMÁNTICA: Compara la naturaleza del texto (¿Es un producto, un servicio, un impuesto, un movimiento bancario o una provisión?) con la naturaleza de la cuenta asignada.
+2. NIVEL DE REGISTRO: Solo son válidas las cuentas de último nivel (detalle). Si la cuenta actual es genérica y existe una específica que nombre el concepto exacto de la descripción, sugiere el cambio.
+3. DETECCIÓN DE "CUENTAS COMODÍN": Si la cuenta actual es una cuenta transitoria o de 'varios' (ej. Facturas por recibir, Cuentas por pagar generales) y en el catálogo aparece la cuenta de destino real (ej. Suministros, Honorarios, Banco específico), márcalo como incorrecto.
+4. JERARQUÍA DE COINCIDENCIA: Prioriza siempre la cuenta que contenga la mayor cantidad de palabras clave de la descripción en su nombre.
+
+FORMATO DE SALIDA (JSON ESTRICTO):
+{{
+    "es_correcta": true/false,
+    "codigo_sugerido": "XXXXXX",
+    "nombre_sugerido": "XXXXXX",
+    "justificacion": "Breve análisis de la discrepancia lógica encontrada."
+}}
+'''
+      
     try:
         completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -51,26 +53,28 @@ def auditar():
         data = request.json
         desc_sql = data.get('descripcion_sql', '')
         cuenta_actual = data.get('cuenta_actual', {})
-        catalogo = data.get('catalogo', [])
+        catalogo_completo = data.get('catalogo', [])
 
-        if not catalogo or not desc_sql:
-            return jsonify({"error": "Faltan datos (catalogo o descripcion)"}), 400
-    
+        if not catalogo_completo or not desc_sql:
+            return jsonify({"error": "Faltan datos"}), 400
+
+        # --- PASO 1: FILTRAR SOLO CUENTAS DE DETALLE (4+ dígitos) ---
+        # Corregido: cambiado de 6 a 4 dígitos como mínimo
         catalogo_detalle = [item for item in catalogo_completo if len(str(item.get('AcctCode', ''))) >= 4]
-        # --- PASO 1: FUZZY MATCHING (Local en Render, no gasta tokens) ---
-        nombres_cat = [item['AcctName'] for item in catalogo]
+        
+        # --- PASO 2: FUZZY MATCHING SOBRE EL CATÁLOGO FILTRADO ---
+        nombres_cat = [item['AcctName'] for item in catalogo_detalle]
         matches = process.extract(desc_sql, nombres_cat, limit=10)
         
         top_10_nombres = [m[0] for m in matches]
-        opciones_reducidas = [item for item in catalogo if item['AcctName'] in top_10_nombres]
+        opciones_reducidas = [item for item in catalogo_detalle if item['AcctName'] in top_10_nombres]
 
-        # --- PASO 2: CONSULTA A GROQ ---
+        # --- PASO 3: CONSULTA A GROQ ---
         resultado_ia = obtener_veredicto_ia(desc_sql, cuenta_actual, opciones_reducidas)
-
         return resultado_ia
 
     except Exception as e:
-        return jsonify({"error": f"Error en el servidor: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 500
 
 # Ruta de prueba para verificar que el servicio está vivo en Render
 @app.route('/')
