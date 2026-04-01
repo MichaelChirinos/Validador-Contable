@@ -11,9 +11,12 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 def obtener_veredicto_ia(descripcion, cuenta_actual, opciones_reducidas):
     prompt = f"""
-    Eres un auditor contable experto en SAP Business One.
-    Factura: "{descripcion}"
-    Cuenta actual: {cuenta_actual['AcctCode']} - {cuenta_actual['AcctName']}
+    Eres un Auditor Senior de SAP Business One experto en el Plan Contable General Empresarial (PCGE).
+    Tu misión es validar si la cuenta contable asignada a una transacción es la correcta o si existe una más específica.
+    
+    DATOS DE LA TRANSACCIÓN:
+    - Glosa/Descripción: "{descripcion}"
+    - Cuenta Asignada Actual: {cuenta_actual['AcctCode']} - {cuenta_actual['AcctName']}
 
     Opciones del catálogo (Top 10 similares):
     {opciones_reducidas}
@@ -52,7 +55,8 @@ def auditar():
 
         if not catalogo or not desc_sql:
             return jsonify({"error": "Faltan datos (catalogo o descripcion)"}), 400
-
+    
+        catalogo_detalle = [item for item in catalogo_completo if len(str(item.get('AcctCode', ''))) >= 4]
         # --- PASO 1: FUZZY MATCHING (Local en Render, no gasta tokens) ---
         nombres_cat = [item['AcctName'] for item in catalogo]
         matches = process.extract(desc_sql, nombres_cat, limit=10)
