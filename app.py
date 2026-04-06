@@ -10,15 +10,25 @@ app = Flask(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # --- CARGA DEL HISTÓRICO (Memoria de Manuchar) ---
+# --- CARGA DEL HISTÓRICO REFORZADA ---
 try:
-    # Asegúrate de que el CSV esté en la misma carpeta que este archivo
-    df_historico = pd.read_csv('results.csv')
-    # Eliminamos duplicados para que la búsqueda sea más rápida y precisa
-    df_historico = df_historico.drop_duplicates(subset=['Dscription', 'AcctCode'])
+    # names: Le asignamos los nombres manualmente ya que el CSV no los tiene
+    # sep: Indicamos que el separador es punto y coma
+    # encoding: Agregamos 'latin-1' por si el SQL exportó tildes o la 'ñ'
+    df_historico = pd.read_csv(
+        'results.csv', 
+        sep=';', 
+        names=['U_ComTip', 'ItemCode', 'Dscription', 'AcctCode', 'AcctName'],
+        encoding='latin-1'
+    )
+    
+    # Limpieza: quitamos filas que tengan la descripción vacía
+    df_historico = df_historico.dropna(subset=['Dscription'])
     historico_list = df_historico['Dscription'].astype(str).tolist()
-    print("Histórico cargado correctamente.")
+    print(f"Histórico cargado: {len(historico_list)} filas encontradas.")
+    
 except Exception as e:
-    print(f"Error cargando histórico: {e}")
+    print(f"Error crítico cargando histórico: {e}")
     df_historico = None
     historico_list = []
 
