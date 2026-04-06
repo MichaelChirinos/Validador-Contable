@@ -12,7 +12,7 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 # --- CARGA DEL HISTÓRICO (Memoria de Manuchar) ---
 try:
     # Asegúrate de que el CSV esté en la misma carpeta que este archivo
-    df_historico = pd.read_csv('historico_manuchar.csv')
+    df_historico = pd.read_csv('results.csv')
     # Eliminamos duplicados para que la búsqueda sea más rápida y precisa
     df_historico = df_historico.drop_duplicates(subset=['Dscription', 'AcctCode'])
     historico_list = df_historico['Dscription'].astype(str).tolist()
