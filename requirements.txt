@@ -3,3 +3,4 @@ thefuzz
 python-Levenshtein
 groq
 gunicorn
+pandas
