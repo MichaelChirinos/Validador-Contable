@@ -2,6 +2,7 @@ import os
 import pandas as pd
 from flask import Flask, request, jsonify
 from thefuzz import process
+import json
 from groq import Groq
 
 app = Flask(__name__)
@@ -117,11 +118,17 @@ def auditar():
 
         # Convertimos el string de la IA a un diccionario de Python y luego a JSON real
         try:
-            resultado_dict = json.loads(resultado_ia_raw)
-            return jsonify(resultado_dict)
+            # Limpiamos posibles etiquetas de Markdown que a veces mete la IA
+            limpio = resultado_ia_raw.replace("```json", "").replace("```", "").strip()
+            resultado_dict = json.loads(limpio)
+            return jsonify(resultado_dict) 
         except Exception as e:
-            return jsonify({"error": "Error parseando JSON de la IA", "raw": resultado_ia_raw}), 500
-        
+            # Si falla el parseo, devolvemos el error pero en formato JSON
+            return jsonify({
+                "error": "La IA no devolvió un JSON válido",
+                "raw_received": resultado_ia_raw
+            }), 500
+            
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
