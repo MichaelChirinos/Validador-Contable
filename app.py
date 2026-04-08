@@ -113,10 +113,15 @@ def auditar():
         contexto_hist = obtener_contexto_historico(desc_sql)
 
         # 4. Veredicto final de la IA
-        resultado_ia = obtener_veredicto_ia(desc_sql, cuenta_actual, opciones_reducidas, contexto_hist)
-        
-        return resultado_ia
+        resultado_ia_raw = obtener_veredicto_ia(desc_sql, cuenta_actual, opciones_reducidas, contexto_hist)
 
+        # Convertimos el string de la IA a un diccionario de Python y luego a JSON real
+        try:
+            resultado_dict = json.loads(resultado_ia_raw)
+            return jsonify(resultado_dict)
+        except Exception as e:
+            return jsonify({"error": "Error parseando JSON de la IA", "raw": resultado_ia_raw}), 500
+        
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
