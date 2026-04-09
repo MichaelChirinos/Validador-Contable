@@ -18,7 +18,7 @@ def cargar_archivos():
     df_h = pd.read_csv(
         'results.csv', 
         sep=';',
-        names=columnas_historico,  # ← Asignamos nombres manualmente
+        names=columnas_historico, 
         encoding='latin-1', 
         on_bad_lines='skip'
     )
