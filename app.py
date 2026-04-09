@@ -10,26 +10,45 @@ app = Flask(__name__)
 # Configuración de Groq
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# --- CARGA DEL HISTÓRICO (versión mejorada con más columnas) ---
+# --- CARGA DEL HISTÓRICO (CSV SIN CABECERAS CON MANEJO DE ERRORES) ---
 try:
-    # Cargamos el CSV con las nuevas columnas
+    columnas = [
+        'ItemCode',      # Col 1
+        'Dscription',    # Col 2
+        'AcctName',      # Col 3
+        'Proveedor',     # Col 4
+        'ItmsGrpNam',    # Col 5
+        'U_TipGasCos',   # Col 6
+        'U_TipOper',     # Col 7
+        'OcrCode3'       # Col 8
+    ]
+    
+    # Intento 1: Lectura normal con tolerancia a errores
     df_historico = pd.read_csv(
         'results.csv', 
-        sep=';',  # Ajusta según tu separador real
-        encoding='latin-1'
+        sep=';',
+        names=columnas,
+        encoding='latin-1',
+        on_bad_lines='skip',  # Salta líneas problemáticas
+        engine='python'       # Motor más tolerante
     )
     
     # Limpieza: quitamos filas que tengan la descripción vacía
     df_historico = df_historico.dropna(subset=['Dscription'])
     
+    # Limpiar valores 'nan' como strings
+    df_historico = df_historico.replace('nan', pd.NA)
+    df_historico = df_historico.replace('NULL', pd.NA)
+    
     # Para la búsqueda fuzzy, seguimos usando SOLO la descripción
     historico_list = df_historico['Dscription'].astype(str).tolist()
     
-    print(f"Histórico cargado: {len(historico_list)} filas encontradas.")
-    print(f"Columnas disponibles: {df_historico.columns.tolist()}")
+    print(f"✅ Histórico cargado exitosamente: {len(historico_list)} filas encontradas.")
+    print(f"📊 Columnas disponibles: {df_historico.columns.tolist()}")
+    print(f"📋 Primeras 3 filas:\n{df_historico.head(3)}")
     
 except Exception as e:
-    print(f"Error crítico cargando histórico: {e}")
+    print(f"❌ Error crítico cargando histórico: {e}")
     df_historico = None
     historico_list = []
 
@@ -49,21 +68,27 @@ def obtener_contexto_historico(desc_nueva, proveedor=None, grupo_item=None, tipo
     
     for m in matches:
         # Buscamos la fila correspondiente al match
-        fila = df_historico[df_historico['Dscription'] == m[0]].iloc[0]
-        contexto += f"- Descripción: '{m[0]}' -> Cuenta usada: {fila['AcctCode']} ({fila['AcctName']})\n"
+        fila = df_historico[df_historico['Dscription'] == m[0]]
+        if not fila.empty:
+            fila = fila.iloc[0]
+            acct_name = fila['AcctName'] if pd.notna(fila['AcctName']) else 'No especificada'
+            contexto += f"- Descripción: '{m[0]}' -> Cuenta usada: {acct_name}\n"
     
     contexto += "\nInstrucción: Si el histórico muestra una tendencia clara, prioriza ese criterio contable sobre la semántica general.\n"
     
     # --- INFORMACIÓN COMPLEMENTARIA (no afecta la búsqueda, solo contexto) ---
     contexto += "\n--- INFORMACIÓN ADICIONAL DEL REGISTRO ACTUAL ---\n"
-    if proveedor and pd.notna(proveedor):
+    if proveedor and pd.notna(proveedor) and str(proveedor) != 'nan' and str(proveedor) != 'NULL':
         contexto += f"- Proveedor: {proveedor}\n"
-    if grupo_item and pd.notna(grupo_item):
+    if grupo_item and pd.notna(grupo_item) and str(grupo_item) != 'nan' and str(grupo_item) != 'NULL':
         contexto += f"- Grupo de Ítem: {grupo_item}\n"
-    if tipo_operacion and pd.notna(tipo_operacion):
+    if tipo_operacion and pd.notna(tipo_operacion) and str(tipo_operacion) != 'nan' and str(tipo_operacion) != 'NULL':
         contexto += f"- Tipo de Operación: {tipo_operacion}\n"
-    if centro_costo and pd.notna(centro_costo):
+    if centro_costo and pd.notna(centro_costo) and str(centro_costo) != 'nan' and str(centro_costo) != 'NULL':
         contexto += f"- Centro de Costo: {centro_costo}\n"
+    
+    if not (proveedor or grupo_item or tipo_operacion or centro_costo):
+        contexto += "No hay información complementaria disponible para este registro.\n"
     
     contexto += "\nNota: Usa esta información adicional solo como referencia. La prioridad sigue siendo el histórico de descripciones similares.\n"
     
@@ -102,7 +127,8 @@ FORMATO DE SALIDA (JSON ESTRICTO):
         completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            timeout=30  # Timeout de 30 segundos
         )
         return completion.choices[0].message.content
     except Exception as e:
@@ -129,10 +155,13 @@ def auditar():
         catalogo_detalle = [item for item in catalogo_completo if len(str(item.get('AcctCode', ''))) >= 4]
         
         # 2. Fuzzy Matching para reducir opciones del catálogo (solo por nombre de cuenta)
-        nombres_cat = [item['AcctName'] for item in catalogo_detalle]
-        matches_cat = process.extract(desc_sql, nombres_cat, limit=10)
-        top_10_nombres = [m[0] for m in matches_cat]
-        opciones_reducidas = [item for item in catalogo_detalle if item['AcctName'] in top_10_nombres]
+        if catalogo_detalle:
+            nombres_cat = [item['AcctName'] for item in catalogo_detalle]
+            matches_cat = process.extract(desc_sql, nombres_cat, limit=10)
+            top_10_nombres = [m[0] for m in matches_cat]
+            opciones_reducidas = [item for item in catalogo_detalle if item['AcctName'] in top_10_nombres]
+        else:
+            opciones_reducidas = []
 
         # 3. Obtener el contexto histórico (con info complementaria)
         contexto_hist = obtener_contexto_historico(
@@ -151,9 +180,17 @@ def auditar():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/')
+@app.route('/health')
 def health_check():
-    return "API de Auditoría Híbrida (IA + Histórico) activa."
+    return jsonify({
+        "status": "active",
+        "historico_filas": len(historico_list) if historico_list else 0,
+        "message": "API de Auditoría Híbrida (IA + Histórico) activa."
+    })
+
+@app.route('/')
+def index():
+    return "API de Auditoría Híbrida (IA + Histórico) activa. Usa /health para verificar estado."
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
