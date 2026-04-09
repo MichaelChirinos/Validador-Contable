@@ -1,196 +1,110 @@
 import os
 import pandas as pd
 from flask import Flask, request, jsonify
-from thefuzz import process
-import json
+from thefuzz import process, fuzz
 from groq import Groq
 
 app = Flask(__name__)
-
-# Configuración de Groq
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# --- CARGA DEL HISTÓRICO (CSV SIN CABECERAS CON MANEJO DE ERRORES) ---
-try:
-    columnas = [
-        'ItemCode',      # Col 1
-        'Dscription',    # Col 2
-        'AcctName',      # Col 3
-        'Proveedor',     # Col 4
-        'ItmsGrpNam',    # Col 5
-        'U_TipGasCos',   # Col 6
-        'U_TipOper',     # Col 7
-        'OcrCode3'       # Col 8
-    ]
-    
-    # Intento 1: Lectura normal con tolerancia a errores
-    df_historico = pd.read_csv(
+# --- CARGA LOCAL ---
+def cargar_archivos():
+    # Histórico (42k registros)
+    df_h = pd.read_csv(
         'results.csv', 
-        sep=';',
-        names=columnas,
-        encoding='latin-1',
-        on_bad_lines='skip',  # Salta líneas problemáticas
-        engine='python'       # Motor más tolerante
+        sep=';', 
+        names=['ItemCode', 'Dscription', 'AcctName', 'Proveedor', 
+               'ItmsGrpNam', 'U_TipGasCos', 'U_TipOper', 'OcrCode3'], 
+        encoding='latin-1', 
+        on_bad_lines='skip'
     )
     
-    # Limpieza: quitamos filas que tengan la descripción vacía
-    df_historico = df_historico.dropna(subset=['Dscription'])
+    # Catálogo SAP
+    df_c = pd.read_csv('catalogo.csv', sep=';', encoding='latin-1')
+    df_c = df_c[df_c['AcctCode'].astype(str).str.len() >= 4]
     
-    # Limpiar valores 'nan' como strings
-    df_historico = df_historico.replace('nan', pd.NA)
-    df_historico = df_historico.replace('NULL', pd.NA)
+    # Limpieza
+    df_h = df_h.dropna(subset=['Dscription'])
+    df_h = df_h.replace(['nan', 'NULL'], pd.NA)
     
-    # Para la búsqueda fuzzy, seguimos usando SOLO la descripción
-    historico_list = df_historico['Dscription'].astype(str).tolist()
+    # Optimización: crear lista una sola vez
+    df_h['desc_lower'] = df_h['Dscription'].astype(str).str.lower()
     
-    print(f"✅ Histórico cargado exitosamente: {len(historico_list)} filas encontradas.")
-    print(f"📊 Columnas disponibles: {df_historico.columns.tolist()}")
-    print(f"📋 Primeras 3 filas:\n{df_historico.head(3)}")
-    
-except Exception as e:
-    print(f"❌ Error crítico cargando histórico: {e}")
-    df_historico = None
-    historico_list = []
+    return df_h, df_c
 
-def obtener_contexto_historico(desc_nueva, proveedor=None, grupo_item=None, tipo_operacion=None, centro_costo=None):
-    """
-    Busca descripciones similares en el histórico (misma lógica de siempre)
-    y agrega información complementaria si está disponible
-    """
-    if not historico_list or df_historico is None:
-        return "No hay datos históricos disponibles para esta empresa."
-    
-    # Búsqueda fuzzy SOLO por descripción (como siempre funcionó)
-    matches = process.extract(desc_nueva, historico_list, limit=3)
-    
-    contexto = "\n--- MEMORIA CRÍTICA (HISTÓRICO DE MANUCHAR) ---\n"
-    contexto += "En registros pasados, descripciones similares se categorizaron así:\n"
-    
-    for m in matches:
-        # Buscamos la fila correspondiente al match
-        fila = df_historico[df_historico['Dscription'] == m[0]]
-        if not fila.empty:
-            fila = fila.iloc[0]
-            acct_name = fila['AcctName'] if pd.notna(fila['AcctName']) else 'No especificada'
-            contexto += f"- Descripción: '{m[0]}' -> Cuenta usada: {acct_name}\n"
-    
-    contexto += "\nInstrucción: Si el histórico muestra una tendencia clara, prioriza ese criterio contable sobre la semántica general.\n"
-    
-    # --- INFORMACIÓN COMPLEMENTARIA (no afecta la búsqueda, solo contexto) ---
-    contexto += "\n--- INFORMACIÓN ADICIONAL DEL REGISTRO ACTUAL ---\n"
-    if proveedor and pd.notna(proveedor) and str(proveedor) != 'nan' and str(proveedor) != 'NULL':
-        contexto += f"- Proveedor: {proveedor}\n"
-    if grupo_item and pd.notna(grupo_item) and str(grupo_item) != 'nan' and str(grupo_item) != 'NULL':
-        contexto += f"- Grupo de Ítem: {grupo_item}\n"
-    if tipo_operacion and pd.notna(tipo_operacion) and str(tipo_operacion) != 'nan' and str(tipo_operacion) != 'NULL':
-        contexto += f"- Tipo de Operación: {tipo_operacion}\n"
-    if centro_costo and pd.notna(centro_costo) and str(centro_costo) != 'nan' and str(centro_costo) != 'NULL':
-        contexto += f"- Centro de Costo: {centro_costo}\n"
-    
-    if not (proveedor or grupo_item or tipo_operacion or centro_costo):
-        contexto += "No hay información complementaria disponible para este registro.\n"
-    
-    contexto += "\nNota: Usa esta información adicional solo como referencia. La prioridad sigue siendo el histórico de descripciones similares.\n"
-    
-    return contexto
-
-def obtener_veredicto_ia(descripcion, cuenta_actual, opciones_reducidas, contexto_historico):
-    prompt = f'''
-Eres un Auditor de Sistemas Contables Senior experto en SAP Business One y el PCGE.
-Tu misión es validar la cuenta contable de una factura de compra.
-
-**DATOS ACTUALES:**
-- Descripción del Ítem: "{descripcion}"
-- Cuenta Asignada Actualmente: {cuenta_actual.get('AcctCode')} - {cuenta_actual.get('AcctName')}
-
-**CONTEXTO DE LA EMPRESA (HISTÓRICO + INFO ADICIONAL):**
-{contexto_historico}
-
-**CATÁLOGO DE CUENTAS DISPONIBLES (Sugerencias):**
-{opciones_reducidas}
-
-**REGLAS DE AUDITORÍA:**
-1. PRIORIDAD HISTÓRICA: El equipo contable tiene criterios específicos. Si el histórico muestra una cuenta usada repetidamente para descripciones similares, prioriza ese criterio.
-2. CONSISTENCIA: Si la cuenta actual coincide con el histórico o con la semántica, marca 'es_correcta': true.
-3. DETECCIÓN DE COMODINES: Si usan cuentas puente (Facturas por recibir, Cuentas por pagar) cuando existe una cuenta de gasto o activo específica, sugiere el cambio.
-4. NIVEL DE DETALLE: Solo son válidas cuentas de registro (4-6 dígitos).
-
-FORMATO DE SALIDA (JSON ESTRICTO):
-{{
-    "es_correcta": true/false,
-    "codigo_sugerido": "XXXXXX",
-    "nombre_sugerido": "XXXXXX",
-    "justificacion": "Explicación técnica considerando el histórico de la empresa y la lógica contable."
-}}
-'''
-    try:
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            timeout=30  # Timeout de 30 segundos
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        return json.dumps({"error_ia": str(e)})
+df_historico, df_catalogo = cargar_archivos()
+historico_desc_list = df_historico['Dscription'].astype(str).tolist()
+catalogo_nombres = df_catalogo['AcctName'].astype(str).tolist()
 
 @app.route('/auditar', methods=['POST'])
 def auditar():
     try:
         data = request.json
-        desc_sql = data.get('descripcion_sql', '')
-        cuenta_actual = data.get('cuenta_actual', {})
-        catalogo_completo = data.get('catalogo', [])
+        desc_f = data.get('descripcion_sql', '')[:150]  # Limitar longitud
+        cuenta_f = data.get('cuenta_actual', {})
         
-        # Nuevos campos complementarios (opcionales)
-        proveedor = data.get('proveedor', '')
-        grupo_item = data.get('grupo_item', '')
-        tipo_operacion = data.get('tipo_operacion', '')
-        centro_costo = data.get('centro_costo', '')
-
-        if not catalogo_completo or not desc_sql:
-            return jsonify({"error": "Faltan datos en la petición"}), 400
-
-        # 1. Filtrar catálogo (Cuentas de registro)
-        catalogo_detalle = [item for item in catalogo_completo if len(str(item.get('AcctCode', ''))) >= 4]
-        
-        # 2. Fuzzy Matching para reducir opciones del catálogo (solo por nombre de cuenta)
-        if catalogo_detalle:
-            nombres_cat = [item['AcctName'] for item in catalogo_detalle]
-            matches_cat = process.extract(desc_sql, nombres_cat, limit=10)
-            top_10_nombres = [m[0] for m in matches_cat]
-            opciones_reducidas = [item for item in catalogo_detalle if item['AcctName'] in top_10_nombres]
-        else:
-            opciones_reducidas = []
-
-        # 3. Obtener el contexto histórico (con info complementaria)
-        contexto_hist = obtener_contexto_historico(
-            desc_sql, 
-            proveedor=proveedor,
-            grupo_item=grupo_item,
-            tipo_operacion=tipo_operacion,
-            centro_costo=centro_costo
+        # --- FUZZY MATCHING LOCAL ---
+        # Búsqueda en histórico (top 3)
+        m_h = process.extract(
+            desc_f, 
+            historico_desc_list, 
+            limit=3, 
+            scorer=fuzz.token_set_ratio
         )
-
-        # 4. Veredicto final de la IA
-        resultado_ia = obtener_veredicto_ia(desc_sql, cuenta_actual, opciones_reducidas, contexto_hist)
         
-        return resultado_ia, 200, {'Content-Type': 'application/json'}
-
+        # Contexto compacto
+        ctx_h = []
+        for val, score in m_h:
+            if score > 50:  # Solo si es relevante
+                row = df_historico[df_historico['Dscription'] == val].iloc[0]
+                ctx_h.append(f"'{val[:40]}'→{row['AcctName']}")
+        
+        ctx_str = " | ".join(ctx_h) if ctx_h else "Sin coincidencias"
+        
+        # Filtrado de catálogo (top 5)
+        m_c = process.extract(
+            desc_f, 
+            catalogo_nombres, 
+            limit=5, 
+            scorer=fuzz.token_set_ratio
+        )
+        
+        # Opciones en formato compacto
+        opciones_red = []
+        for nombre, score in m_c:
+            row = df_catalogo[df_catalogo['AcctName'] == nombre].iloc[0]
+            opciones_red.append(f"{row['AcctCode']}-{nombre[:35]}")
+        
+        opciones_str = " | ".join(opciones_red)
+        
+        # --- PROMPT MINIMALISTA ---
+        prompt = f"""Auditor SAP. Valida: "{desc_f[:80]}"
+Actual: {cuenta_f.get('AcctCode')} - {cuenta_f.get('AcctName')}
+Histórico: {ctx_str}
+Opciones: {opciones_str}
+Reglas: Prioriza histórico. Si coincide actual→true.
+JSON: {{"es_correcta":bool, "codigo_sugerido":"str", "nombre_sugerido":"str", "justificacion":"str"}}"""
+        
+        res = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0.1,
+            max_tokens=300  # Limitar output también
+        )
+        
+        return res.choices[0].message.content, 200, {'Content-Type': 'application/json'}
+    
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route('/health')
-def health_check():
+def health():
     return jsonify({
         "status": "active",
-        "historico_filas": len(historico_list) if historico_list else 0,
-        "message": "API de Auditoría Híbrida (IA + Histórico) activa."
+        "historico": len(df_historico),
+        "catalogo": len(df_catalogo)
     })
-
-@app.route('/')
-def index():
-    return "API de Auditoría Híbrida (IA + Histórico) activa. Usa /health para verificar estado."
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
