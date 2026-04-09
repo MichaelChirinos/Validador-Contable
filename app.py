@@ -20,7 +20,7 @@ def cargar_archivos():
     )
     
     # Catálogo SAP
-    df_c = pd.read_csv('catalogo.csv', sep=';', encoding='latin-1')
+    df_c = pd.read_csv('results_1.csv', sep=';', encoding='latin-1')
     df_c = df_c[df_c['AcctCode'].astype(str).str.len() >= 4]
     
     # Limpieza
