@@ -30,7 +30,7 @@ def cargar_archivos():
     columnas_catalogo = ['AcctCode', 'AcctName']
     
     df_c = pd.read_csv(
-        'catalogo.csv', 
+        'results_1.csv', 
         sep=';',
         names=columnas_catalogo,  # ← Asignamos nombres manualmente
         encoding='latin-1',
