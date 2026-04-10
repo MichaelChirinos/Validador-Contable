@@ -10,7 +10,31 @@ from datetime import datetime
 app = Flask(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# --- CARGA DE CATÁLOGO ---
+# --- MEMORIA PERSISTENTE ---
+MEMORIA_ARCHIVO = 'memoria.json'
+METRICAS_ARCHIVO = 'metricas.json'
+
+def cargar_memoria():
+    if os.path.exists(MEMORIA_ARCHIVO):
+        with open(MEMORIA_ARCHIVO, 'r', encoding='latin-1') as f:
+            return json.load(f)
+    return {}
+
+def guardar_memoria(memoria):
+    with open(MEMORIA_ARCHIVO, 'w', encoding='latin-1') as f:
+        json.dump(memoria, f, indent=2)
+
+def cargar_metricas():
+    if os.path.exists(METRICAS_ARCHIVO):
+        with open(METRICAS_ARCHIVO, 'r', encoding='latin-1') as f:
+            return json.load(f)
+    return {'total': 0, 'acertados': 0, 'historial': []}
+
+def guardar_metricas(metricas):
+    with open(METRICAS_ARCHIVO, 'w', encoding='latin-1') as f:
+        json.dump(metricas, f, indent=2)
+
+# --- CARGA DE CATÁLOGO (para validar códigos) ---
 df_catalogo = pd.read_csv(
     'results_1.csv', 
     sep=';',
@@ -19,6 +43,7 @@ df_catalogo = pd.read_csv(
     on_bad_lines='skip'
 )
 catalogo_codigos = df_catalogo['AcctCode'].astype(str).tolist()
+catalogo_nombres = df_catalogo['AcctName'].astype(str).tolist()
 
 def obtener_nombre_desde_catalogo(codigo):
     """Busca el nombre REAL de la cuenta en el catálogo"""
@@ -41,6 +66,25 @@ def obtener_nombre_desde_catalogo(codigo):
     
     return None
 
+def obtener_codigo_desde_catalogo_por_nombre(nombre):
+    """Busca el código REAL de la cuenta por su nombre"""
+    if not nombre:
+        return None
+    
+    # Búsqueda exacta
+    fila = df_catalogo[df_catalogo['AcctName'] == nombre]
+    if not fila.empty:
+        return str(fila.iloc[0]['AcctCode'])
+    
+    # Búsqueda fuzzy
+    match = process.extractOne(nombre, catalogo_nombres, scorer=fuzz.token_set_ratio)
+    if match and match[1] > 80:
+        fila = df_catalogo[df_catalogo['AcctName'] == match[0]]
+        if not fila.empty:
+            return str(fila.iloc[0]['AcctCode'])
+    
+    return None
+
 def es_codigo_valido(codigo):
     """Código de cuenta debe ser 4-6 dígitos numéricos"""
     if not codigo:
@@ -48,7 +92,7 @@ def es_codigo_valido(codigo):
     return bool(re.match(r'^\d{4,6}$', str(codigo).strip()))
 
 def corregir_codigo_sugerido(codigo_sugerido, codigo_actual):
-    """Corrige códigos alucinados (letras, muy cortos, etc.)"""
+    """Corrige códigos alucinados"""
     if es_codigo_valido(codigo_sugerido):
         return codigo_sugerido
     
@@ -60,21 +104,6 @@ def corregir_codigo_sugerido(codigo_sugerido, codigo_actual):
     
     # Si no hay match, usar el código actual
     return codigo_actual
-
-# --- MEMORIA PERSISTENTE ---
-MEMORIA_ARCHIVO = 'memoria.json'
-MEMORIA = {}
-
-def cargar_memoria():
-    global MEMORIA
-    if os.path.exists(MEMORIA_ARCHIVO):
-        with open(MEMORIA_ARCHIVO, 'r', encoding='latin-1') as f:
-            MEMORIA = json.load(f)
-    print(f"📚 Memoria cargada: {len(MEMORIA)} patrones")
-
-def guardar_memoria():
-    with open(MEMORIA_ARCHIVO, 'w', encoding='latin-1') as f:
-        json.dump(MEMORIA, f, indent=2)
 
 def extraer_patron(desc):
     """Extrae patrón general de la descripción"""
@@ -116,7 +145,28 @@ def aprender(descripcion, codigo, nombre, correcta):
             MEMORIA[patron]['aciertos'] += 1
         MEMORIA[patron]['ultimo'] = datetime.now().isoformat()
     
-    guardar_memoria()
+    guardar_memoria(MEMORIA)
+
+def registrar_metrica(descripcion, fue_correcta, codigo_usado, codigo_sugerido):
+    """Registrar métricas para tracking de precisión"""
+    metricas = cargar_metricas()
+    metricas['total'] += 1
+    if fue_correcta:
+        metricas['acertados'] += 1
+    
+    metricas['historial'].append({
+        'fecha': datetime.now().isoformat(),
+        'descripcion': descripcion[:100],
+        'codigo_usado': codigo_usado,
+        'codigo_sugerido': codigo_sugerido,
+        'correcta': fue_correcta
+    })
+    
+    if len(metricas['historial']) > 1000:
+        metricas['historial'] = metricas['historial'][-1000:]
+    
+    guardar_metricas(metricas)
+    return metricas
 
 # --- CARGA DEL HISTÓRICO ---
 df_historico = pd.read_csv(
@@ -130,8 +180,12 @@ df_historico = pd.read_csv(
 df_historico = df_historico.dropna(subset=['Dscription'])
 historico_desc_list = df_historico['Dscription'].astype(str).tolist()
 
-# Inicializar
-cargar_memoria()
+# Cargar memoria al inicio
+MEMORIA = cargar_memoria()
+metricas = cargar_metricas()
+precision = (metricas['acertados'] / metricas['total'] * 100) if metricas['total'] > 0 else 0
+print(f"📚 Memoria cargada: {len(MEMORIA)} patrones")
+print(f"📊 Precisión actual: {precision:.1f}% ({metricas['acertados']}/{metricas['total']})")
 
 @app.route('/auditar', methods=['POST'])
 def auditar():
@@ -154,6 +208,7 @@ def auditar():
                 "justificacion": f"📚 Basado en {recordado['veces']} casos previos",
                 "confianza": recordado['aciertos'] / recordado['veces']
             }
+            registrar_metrica(desc_f, es_correcta, codigo_actual, resultado['codigo_sugerido'])
             return jsonify(resultado)
         
         # --- 2. Buscar contexto histórico ---
@@ -165,50 +220,59 @@ def auditar():
                 ctx += f"- {val[:50]} → {row['AcctName']}\n"
         
         # --- 3. Llamar a IA ---
-        prompt = f"""Valida esta factura de compra:
-
-Descripción: "{desc_f[:100]}"
-Cuenta actual: {codigo_actual} - {nombre_actual}
-
-Referencias históricas:
-{ctx}
-
-Responde SOLO en JSON:
-{{"es_correcta": true/false, "codigo_sugerido": "código de 4-6 dígitos", "nombre_sugerido": "nombre de la cuenta", "justificacion": "explicación breve"}}"""
+        prompt = f"""Valida: "{desc_f[:80]}"
+Actual: {codigo_actual} - {nombre_actual}
+Ref: {ctx}
+JSON: {{"es_correcta":bool, "codigo_sugerido":"str", "nombre_sugerido":"str", "justificacion":"str"}}"""
 
         res = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0.1,
-            max_tokens=300
+            max_tokens=200
         )
         
         resultado = json.loads(res.choices[0].message.content)
         
-        # --- 4. Validar y corregir el código sugerido ---
+        # --- 4. CORRECCIÓN: Priorizar coincidencia de nombres ---
+        nombre_sugerido_ia = resultado.get('nombre_sugerido', '')
         codigo_sugerido_ia = str(resultado.get('codigo_sugerido', codigo_actual))
-        nombre_sugerido_ia = resultado.get('nombre_sugerido', nombre_actual)
         
-        # Verificar si el código existe en el catálogo
-        nombre_real = obtener_nombre_desde_catalogo(codigo_sugerido_ia)
-        
-        if nombre_real:
-            # El código existe, usar el nombre real del catálogo
-            resultado['codigo_sugerido'] = codigo_sugerido_ia
-            resultado['nombre_sugerido'] = nombre_real
+        # Si el nombre sugerido por IA es IGUAL al nombre actual del SQL
+        if nombre_sugerido_ia == nombre_actual:
+            # Usar el código actual (el que ya está asociado a ese nombre)
+            resultado['codigo_sugerido'] = codigo_actual
+            resultado['nombre_sugerido'] = nombre_actual
+            resultado['justificacion'] = f"✓ Nombre coincide con actual: {nombre_actual}. Se mantiene código {codigo_actual}."
         else:
-            # El código no existe, probablemente alucinación
-            # Buscar si hay algún código similar en el catálogo
-            codigo_corregido = corregir_codigo_sugerido(codigo_sugerido_ia, codigo_actual)
-            nombre_corregido = obtener_nombre_desde_catalogo(codigo_corregido)
+            # Verificar si el código sugerido existe y obtener su nombre real
+            nombre_real = obtener_nombre_desde_catalogo(codigo_sugerido_ia)
             
-            resultado['codigo_sugerido'] = codigo_corregido
-            resultado['nombre_sugerido'] = nombre_corregido if nombre_corregido else nombre_actual
-            resultado['justificacion'] = f"⚠️ El código '{codigo_sugerido_ia}' no es válido. {resultado.get('justificacion', '')}"
+            if nombre_real:
+                resultado['codigo_sugerido'] = codigo_sugerido_ia
+                resultado['nombre_sugerido'] = nombre_real
+            else:
+                # Si el código no existe, buscar por nombre en catálogo
+                codigo_por_nombre = obtener_codigo_desde_catalogo_por_nombre(nombre_sugerido_ia)
+                if codigo_por_nombre:
+                    resultado['codigo_sugerido'] = codigo_por_nombre
+                    resultado['nombre_sugerido'] = nombre_sugerido_ia
+                    resultado['justificacion'] = f"🔍 Buscado por nombre: '{nombre_sugerido_ia}' → código {codigo_por_nombre}"
+                else:
+                    # Si no hay match, usar código actual
+                    resultado['codigo_sugerido'] = codigo_actual
+                    resultado['nombre_sugerido'] = nombre_actual
+                    resultado['justificacion'] = f"⚠️ No se encontró coincidencia. Se mantiene {codigo_actual} - {nombre_actual}"
         
-        # --- 5. Aprender de esta consulta ---
-        aprender(desc_f, resultado['codigo_sugerido'], resultado['nombre_sugerido'], resultado.get('es_correcta', False))
+        # --- 5. Validar si es correcta (si el código sugerido es el actual) ---
+        if resultado['codigo_sugerido'] == codigo_actual:
+            resultado['es_correcta'] = True
+        
+        # --- 6. Aprender ---
+        aprender(desc_f, resultado['codigo_sugerido'], resultado['nombre_sugerido'], resultado['es_correcta'])
+        
+        registrar_metrica(desc_f, resultado['es_correcta'], codigo_actual, resultado['codigo_sugerido'])
         
         return jsonify(resultado)
     
@@ -241,26 +305,42 @@ def feedback():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/memoria', methods=['GET'])
+@app.route('/metricas')
+def obtener_metricas():
+    """Ver precisión actual"""
+    metricas = cargar_metricas()
+    precision = (metricas['acertados'] / metricas['total'] * 100) if metricas['total'] > 0 else 0
+    
+    return jsonify({
+        "total_evaluaciones": metricas['total'],
+        "acertados": metricas['acertados'],
+        "precisión_porcentaje": round(precision, 2),
+        "patrones_aprendidos": len(MEMORIA),
+        "ultimos_10": metricas['historial'][-10:]
+    })
+
+@app.route('/memoria')
 def ver_memoria():
     """Ver todos los patrones aprendidos"""
     return jsonify({
         "total_patrones": len(MEMORIA),
-        "patrones": {k: v for k, v in list(MEMORIA.items())[:50]}  # Mostrar primeros 50
+        "patrones": {k: v for k, v in list(MEMORIA.items())[:50]}
     })
 
 @app.route('/health')
 def health():
+    metricas = cargar_metricas()
+    precision = (metricas['acertados'] / metricas['total'] * 100) if metricas['total'] > 0 else 0
     return jsonify({
         "status": "active",
-        "memoria_patrones": len(MEMORIA),
-        "catalogo_cuentas": len(catalogo_codigos),
-        "historico_filas": len(historico_desc_list)
+        "patrones_aprendidos": len(MEMORIA),
+        "precision_actual": f"{precision:.1f}%",
+        "total_evaluaciones": metricas['total']
     })
 
 @app.route('/')
 def index():
-    return "API de Auditoría Contable activa. Endpoints: /auditar, /feedback, /memoria, /health"
+    return "API de Auditoría Contable activa. Endpoints: /auditar, /feedback, /metricas, /memoria, /health"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
