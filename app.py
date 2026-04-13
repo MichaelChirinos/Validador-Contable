@@ -37,29 +37,28 @@ def obtener_nombre_real(codigo):
     return catalogo_dict.get(str(codigo), None)
 
 def extraer_palabras_clave(desc):
-    """Extrae palabras clave de forma genérica (sin hardcodeo)"""
+    """Extrae SOLO las palabras más importantes"""
     if not desc:
         return ""
     
     desc = desc.lower()
+    # Eliminar códigos
+    desc = re.sub(r'\b[a-z]{2,4}[\s-]*\d+\b', '', desc)
+    desc = re.sub(r'dcc', '', desc)
+    desc = re.sub(r'\d+', '', desc)
+    # Eliminar nombres de personas (patrón: nombre apellido)
+    desc = re.sub(r'\b[a-z]+\s+[a-z]+\s+[a-z]+\b', '', desc)
+    desc = re.sub(r'\b[a-z]+\s+[a-z]+\b', '', desc)
+    # Limpiar
+    desc = re.sub(r'[^\w\s]', ' ', desc)
     
-    # Eliminar códigos como DCC02563, F9Z-716, placa BZK-628
-    desc = re.sub(r'\b[a-z]{2,4}[\s-]*\d{3,}\b', '', desc)
-    # Eliminar números sueltos
-    desc = re.sub(r'\b\d{3,}\b', '', desc)
-    # Eliminar guiones y caracteres especiales
-    desc = re.sub(r'[^\w\sáéíóúñ]', ' ', desc)
-    
-    # Extraer palabras (incluyendo acentos)
     palabras = re.findall(r'[a-záéíóúñ]+', desc)
-    # Filtrar palabras muy cortas y comunes
-    palabras_importantes = [p for p in palabras if len(p) > 3 and p not in ['para', 'por', 'con', 'sin', 'sobre']]
-    
-    # Limitar a 5 palabras clave
-    return ' '.join(palabras_importantes[:5])
+    # Solo palabras significativas (longitud > 4)
+    palabras = [p for p in palabras if len(p) > 4]
+    return ' '.join(palabras[:3])
 
 def recordar(descripcion, historico_df, historico_list):
-    """Busca en memoria primero, luego en histórico"""
+    """Busca coincidencia EXACTA o muy similar"""
     patron = extraer_palabras_clave(descripcion)
     
     if not patron:
@@ -69,23 +68,43 @@ def recordar(descripcion, historico_df, historico_list):
     if patron in MEMORIA:
         return MEMORIA[patron]
     
-    # 2. Buscar en histórico (fuzzy)
-    matches = process.extract(descripcion, historico_list, limit=5, scorer=fuzz.token_set_ratio)
+    # 2. Buscar coincidencia EXACTA en histórico
+    for idx, row in historico_df.iterrows():
+        if row['Dscription'].lower() == descripcion.lower():
+            nombre_historico = row['AcctName']
+            for code, name in catalogo_dict.items():
+                if name == nombre_historico:
+                    resultado = {'codigo': code, 'nombre': name, 'score': 100}
+                    MEMORIA[patron] = resultado
+                    guardar_memoria(MEMORIA)
+                    return resultado
     
-    for val, score in matches:
+    # 3. Buscar coincidencia por palabras clave (más estricto)
+    palabras_desc = set(patron.split())
+    mejores = []
+    
+    for idx, row in historico_df.iterrows():
+        desc_hist = row['Dscription'].lower()
+        palabras_hist = set(extraer_palabras_clave(desc_hist).split())
+        
+        if palabras_hist:
+            interseccion = palabras_desc.intersection(palabras_hist)
+            if len(interseccion) >= 2:  # Al menos 2 palabras clave coinciden
+                score = len(interseccion) / max(len(palabras_desc), len(palabras_hist)) * 100
+                mejores.append((row, score))
+    
+    if mejores:
+        mejores.sort(key=lambda x: x[1], reverse=True)
+        mejor_row, score = mejores[0]
         if score > 60:
-            try:
-                row = historico_df[historico_df['Dscription'] == val].iloc[0]
-                nombre_historico = row['AcctName']
-                # Buscar el código real en catálogo
-                for code, name in catalogo_dict.items():
-                    if name == nombre_historico:
-                        # Aprender esta asociación
-                        MEMORIA[patron] = {'codigo': code, 'nombre': name, 'veces': 1, 'score': score}
+            nombre_historico = mejor_row['AcctName']
+            for code, name in catalogo_dict.items():
+                if name == nombre_historico:
+                    resultado = {'codigo': code, 'nombre': name, 'score': score}
+                    if score > 85:
+                        MEMORIA[patron] = resultado
                         guardar_memoria(MEMORIA)
-                        return {'codigo': code, 'nombre': name, 'score': score}
-            except:
-                continue
+                    return resultado
     
     return None
 
@@ -93,9 +112,8 @@ def recordar(descripcion, historico_df, historico_list):
 print("📚 Cargando histórico...")
 df_historico = pd.read_csv(
     'results.csv', 
-    sep=';',
-    names=['ItemCode', 'Dscription', 'AcctName', 'Proveedor', 
-           'ItmsGrpNam', 'U_TipGasCos', 'U_TipOper', 'OcrCode3'], 
+    sep='\t',  # Cambia a tabulación
+    names=['Dscription', 'AcctName'],
     encoding='latin-1', 
     on_bad_lines='skip'
 )
@@ -115,30 +133,25 @@ def auditar():
         codigo_actual = str(cuenta_actual.get('AcctCode', ''))
         nombre_actual = cuenta_actual.get('AcctName', '')
         
-        # Buscar en memoria/histórico
+        # Buscar en histórico
         recordado = recordar(desc_f, df_historico, historico_desc_list)
         
-        if recordado:
-            codigo_sugerido = recordado['codigo']
-            nombre_sugerido = recordado['nombre']
-            es_correcta = (codigo_sugerido == codigo_actual)
-            confianza = recordado.get('score', 70) / 100
-            
+        if recordado and recordado['codigo'] != codigo_actual:
             return jsonify({
-                "es_correcta": es_correcta,
-                "codigo_sugerido": codigo_sugerido,
-                "nombre_sugerido": nombre_sugerido,
-                "justificacion": f"📚 Coincidencia en histórico ({recordado.get('score', 0):.0f}%)",
-                "confianza": confianza
+                "es_correcta": False,
+                "codigo_sugerido": recordado['codigo'],
+                "nombre_sugerido": recordado['nombre'],
+                "justificacion": f"📚 Según histórico: {recordado['nombre']}",
+                "confianza": recordado.get('score', 0) / 100
             })
         
-        # Sin coincidencia, mantener actual
+        # Por defecto, mantener actual
         return jsonify({
             "es_correcta": True,
             "codigo_sugerido": codigo_actual,
             "nombre_sugerido": nombre_actual,
-            "justificacion": "✓ Sin coincidencias, se mantiene cuenta actual",
-            "confianza": 0.5
+            "justificacion": "✓ Se mantiene cuenta actual",
+            "confianza": 0.7
         })
     
     except Exception as e:
@@ -156,7 +169,7 @@ def feedback():
             return jsonify({"error": "Código no existe"}), 400
         
         patron = extraer_palabras_clave(desc_f)
-        MEMORIA[patron] = {'codigo': codigo_correcto, 'nombre': nombre_real, 'veces': 1}
+        MEMORIA[patron] = {'codigo': codigo_correcto, 'nombre': nombre_real, 'score': 100}
         guardar_memoria(MEMORIA)
         
         return jsonify({"status": "✅ Aprendido"})
