@@ -10,9 +10,8 @@ from datetime import datetime
 app = Flask(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# --- MEMORIA PERSISTENTE ---
+# --- MEMORIA PERSISTENTE (aprende de la IA) ---
 MEMORIA_ARCHIVO = 'memoria.json'
-FEEDBACK_ARCHIVO = 'feedback.json'
 
 def cargar_memoria():
     if os.path.exists(MEMORIA_ARCHIVO):
@@ -24,16 +23,6 @@ def guardar_memoria(memoria):
     with open(MEMORIA_ARCHIVO, 'w', encoding='latin-1') as f:
         json.dump(memoria, f, indent=2)
 
-def cargar_feedback():
-    if os.path.exists(FEEDBACK_ARCHIVO):
-        with open(FEEDBACK_ARCHIVO, 'r', encoding='latin-1') as f:
-            return json.load(f)
-    return {}
-
-def guardar_feedback(feedback):
-    with open(FEEDBACK_ARCHIVO, 'w', encoding='latin-1') as f:
-        json.dump(feedback, f, indent=2)
-
 # --- CARGA DE CATÁLOGO ---
 df_catalogo = pd.read_csv(
     'results_1.csv', 
@@ -44,101 +33,43 @@ df_catalogo = pd.read_csv(
 )
 catalogo_dict = dict(zip(df_catalogo['AcctCode'].astype(str), df_catalogo['AcctName']))
 
-def obtener_nombre_real(codigo):
-    return catalogo_dict.get(str(codigo), None)
-
-def extraer_palabras_clave(desc):
-    """Extrae palabras clave relevantes"""
-    if not desc or desc == 'NULL':
-        return ""
-    
-    desc = desc.lower()
-    # Eliminar patrones comunes
-    desc = re.sub(r'dcc\s*\d+\s*-?\s*', '', desc)
-    desc = re.sub(r'fee|ee', '', desc, flags=re.IGNORECASE)
-    desc = re.sub(r'[a-z]+\s+[a-z]+\s+[a-z]+', '', desc)
-    desc = re.sub(r'\d+', '', desc)
-    desc = re.sub(r'[^\w\sáéíóúñ]', ' ', desc)
-    
-    palabras = re.findall(r'[a-záéíóúñ]{4,}', desc)
-    return ' '.join(palabras[:3])
-
-# --- CARGA DEL HISTÓRICO (con las columnas correctas) ---
-print("📚 Cargando histórico...")
-print("   Columnas: ItemCode, Dscription, AcctName, Proveedor, ItmsGrpNam, U_TipGasCos, U_TipOper, OcrCode3")
-
+# --- CARGA DEL HISTÓRICO ---
 df_historico = pd.read_csv(
     'results.csv', 
-    sep=';',  # Por el ejemplo que diste, usa punto y coma
+    sep=';',
     names=['ItemCode', 'Dscription', 'AcctName', 'Proveedor', 
            'ItmsGrpNam', 'U_TipGasCos', 'U_TipOper', 'OcrCode3'],
     encoding='latin-1', 
     on_bad_lines='skip'
 )
-
-# Limpiar datos NULL
-df_historico = df_historico.replace('NULL', pd.NA)
 df_historico = df_historico.dropna(subset=['Dscription', 'AcctName'])
-df_historico = df_historico[df_historico['Dscription'].str.strip() != '']
-
-print(f"📊 Histórico cargado: {len(df_historico)} descripciones")
-print(f"   Ejemplo: '{df_historico.iloc[0]['Dscription'][:50]}' → {df_historico.iloc[0]['AcctName']}")
-
-# Crear índice para búsqueda rápida
-desc_to_acct = dict(zip(df_historico['Dscription'].str.lower(), df_historico['AcctName']))
 historico_desc_list = df_historico['Dscription'].tolist()
+desc_to_acct = dict(zip(df_historico['Dscription'].str.lower(), df_historico['AcctName']))
 
-# Cargar memorias
 MEMORIA = cargar_memoria()
-FEEDBACK_DB = cargar_feedback()
-print(f"📚 Memoria: {len(MEMORIA)} patrones")
-print(f"📝 Feedback: {len(FEEDBACK_DB)} correcciones")
+print(f"📚 Memoria: {len(MEMORIA)} patrones aprendidos")
+print(f"📊 Histórico: {len(historico_desc_list)} registros")
 
-def recordar(descripcion):
-    """Busca coincidencia usando múltiples estrategias"""
-    if not descripcion:
-        return None
-        
-    desc_lower = descripcion.lower()
-    
-    # 1. Feedback manual (prioridad máxima)
-    for key, value in FEEDBACK_DB.items():
-        if key in desc_lower or desc_lower in key:
-            print(f"   ✅ Feedback encontrado: {key[:30]}...")
-            return {'codigo': value['codigo'], 'nombre': value['nombre'], 'score': 100, 'tipo': 'feedback'}
-    
-    # 2. Coincidencia exacta en histórico
-    if desc_lower in desc_to_acct:
-        nombre_historico = desc_to_acct[desc_lower]
-        for code, name in catalogo_dict.items():
-            if name == nombre_historico:
-                print(f"   ✅ Coincidencia exacta")
-                return {'codigo': code, 'nombre': name, 'score': 100, 'tipo': 'exacta'}
-    
-    # 3. Memoria por palabras clave
-    patron = extraer_palabras_clave(descripcion)
-    if patron and patron in MEMORIA:
-        print(f"   📚 Memoria: {patron}")
-        return MEMORIA[patron]
-    
-    # 4. Búsqueda por palabra clave en histórico
-    palabras_busqueda = extraer_palabras_clave(descripcion).split()
-    for palabra in palabras_busqueda:
-        if len(palabra) > 3:
-            matches = [d for d in historico_desc_list if palabra in d.lower()]
-            if matches:
-                mejor_match = matches[0]
-                nombre_historico = desc_to_acct.get(mejor_match.lower())
-                if nombre_historico:
-                    for code, name in catalogo_dict.items():
-                        if name == nombre_historico:
-                            resultado = {'codigo': code, 'nombre': name, 'score': 70, 'tipo': 'palabra_clave'}
-                            if patron:
-                                MEMORIA[patron] = resultado
-                                guardar_memoria(MEMORIA)
-                            return resultado
-    
-    return None
+def extraer_patron(desc):
+    """Extrae patrón general de la descripción"""
+    desc = desc.lower()
+    desc = re.sub(r'dcc\s*\d+\s*-?\s*', '', desc)
+    desc = re.sub(r'[a-z]+\s+[a-z]+\s+[a-z]+', '', desc)
+    desc = re.sub(r'\d+', '#', desc)
+    desc = re.sub(r'[^\w\s]', ' ', desc)
+    palabras = re.findall(r'[a-záéíóúñ]{4,}', desc)
+    return ' '.join(palabras[:3])
+
+def buscar_contexto_historico(descripcion):
+    """Busca contexto en histórico para darle a la IA"""
+    matches = process.extract(descripcion, historico_desc_list, limit=3, scorer=fuzz.token_set_ratio)
+    contexto = []
+    for val, score in matches:
+        if score > 50:
+            nombre = desc_to_acct.get(val.lower(), '')
+            if nombre:
+                contexto.append(f"- '{val[:60]}' → {nombre}")
+    return '\n'.join(contexto)
 
 @app.route('/auditar', methods=['POST'])
 def auditar():
@@ -149,55 +80,99 @@ def auditar():
         codigo_actual = str(cuenta_actual.get('AcctCode', ''))
         nombre_actual = cuenta_actual.get('AcctName', '')
         
-        print(f"\n📝 Auditando: {desc_f[:80]}")
-        print(f"   Actual: {codigo_actual} - {nombre_actual}")
+        # --- 1. Buscar en MEMORIA (aprendizaje previo) ---
+        patron = extraer_patron(desc_f)
+        if patron in MEMORIA:
+            recordado = MEMORIA[patron]
+            if recordado['codigo'] != codigo_actual:
+                return jsonify({
+                    "es_correcta": False,
+                    "codigo_sugerido": recordado['codigo'],
+                    "nombre_sugerido": recordado['nombre'],
+                    "justificacion": f"📚 Aprendido de {recordado['veces']} casos similares",
+                    "confianza": 0.9
+                })
+            else:
+                return jsonify({
+                    "es_correcta": True,
+                    "codigo_sugerido": codigo_actual,
+                    "nombre_sugerido": nombre_actual,
+                    "justificacion": "✓ Consistente con aprendizaje previo",
+                    "confianza": 0.9
+                })
         
-        recordado = recordar(desc_f)
+        # --- 2. Usar IA de Groq para analizar ---
+        contexto = buscar_contexto_historico(desc_f)
         
-        if recordado and recordado['codigo'] != codigo_actual:
-            print(f"   ✨ Sugerencia: {recordado['codigo']} - {recordado['nombre']}")
-            return jsonify({
-                "es_correcta": False,
-                "codigo_sugerido": recordado['codigo'],
-                "nombre_sugerido": recordado['nombre'],
-                "justificacion": f"📚 {recordado['tipo']}: {recordado['nombre']}",
-                "confianza": recordado.get('score', 70) / 100
-            })
+        prompt = f"""Eres un auditor contable senior. Analiza esta factura:
+
+DESCRIPCIÓN: "{desc_f[:150]}"
+CUENTA ACTUAL: {codigo_actual} - {nombre_actual}
+
+CONTEXTO HISTÓRICO (referencias similares):
+{contexto}
+
+REGLAS:
+- Usa el contexto histórico como guía, pero no como regla absoluta
+- Si la cuenta actual es razonable para la descripción, marca es_correcta = true
+- Si no, sugiere la cuenta correcta basada en tu conocimiento contable
+- Sé CONSISTENTE: productos similares deben tener la misma cuenta
+
+RESPONDE SOLO EN JSON:
+{{"es_correcta": true/false, "codigo_sugerido": "string", "nombre_sugerido": "string", "justificacion": "string"}}"""
+
+        res = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0.1,
+            max_tokens=300
+        )
         
-        print(f"   ✓ Manteniendo cuenta actual")
-        return jsonify({
-            "es_correcta": True,
-            "codigo_sugerido": codigo_actual,
-            "nombre_sugerido": nombre_actual,
-            "justificacion": "✓ Se mantiene cuenta actual",
-            "confianza": 0.5
-        })
+        resultado = json.loads(res.choices[0].message.content)
+        
+        # --- 3. APRENDER de la decisión de la IA ---
+        if patron:
+            if patron not in MEMORIA:
+                MEMORIA[patron] = {
+                    'codigo': resultado.get('codigo_sugerido', codigo_actual),
+                    'nombre': resultado.get('nombre_sugerido', nombre_actual),
+                    'veces': 1
+                }
+            else:
+                MEMORIA[patron]['veces'] += 1
+            guardar_memoria(MEMORIA)
+            print(f"📚 Aprendido: '{patron}' → {MEMORIA[patron]['codigo']} (veces: {MEMORIA[patron]['veces']})")
+        
+        return jsonify(resultado)
     
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"Error: {e}")
         return jsonify({"error": str(e), "es_correcta": False}), 500
 
 @app.route('/feedback', methods=['POST'])
 def feedback():
+    """Corrección manual para casos donde la IA falla"""
     try:
         data = request.json
-        desc_f = data.get('descripcion', '').lower()
+        desc_f = data.get('descripcion', '')
         codigo_correcto = data.get('codigo_correcto', '')
         
-        nombre_real = obtener_nombre_real(codigo_correcto)
+        nombre_real = catalogo_dict.get(str(codigo_correcto))
         if not nombre_real:
             return jsonify({"error": "Código no existe"}), 400
         
-        FEEDBACK_DB[desc_f] = {'codigo': codigo_correcto, 'nombre': nombre_real}
-        guardar_feedback(FEEDBACK_DB)
+        patron = extraer_patron(desc_f)
+        MEMORIA[patron] = {
+            'codigo': codigo_correcto,
+            'nombre': nombre_real,
+            'veces': MEMORIA.get(patron, {}).get('veces', 0) + 1,
+            'feedback': True
+        }
+        guardar_memoria(MEMORIA)
         
-        patron = extraer_palabras_clave(desc_f)
-        if patron:
-            MEMORIA[patron] = {'codigo': codigo_correcto, 'nombre': nombre_real, 'score': 100, 'tipo': 'feedback'}
-            guardar_memoria(MEMORIA)
-        
-        print(f"📝 Feedback: '{desc_f[:50]}' → {codigo_correcto}")
-        return jsonify({"status": "✅ Aprendido"})
+        print(f"📝 Feedback: '{patron}' → {codigo_correcto}")
+        return jsonify({"status": "✅ Corregido y aprendido"})
     
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -205,9 +180,8 @@ def feedback():
 @app.route('/memoria')
 def ver_memoria():
     return jsonify({
-        "memoria": len(MEMORIA),
-        "feedback": len(FEEDBACK_DB),
-        "ejemplos": dict(list(FEEDBACK_DB.items())[:20])
+        "total_patrones": len(MEMORIA),
+        "patrones": dict(list(MEMORIA.items())[:30])
     })
 
 @app.route('/health')
@@ -215,8 +189,8 @@ def health():
     return jsonify({
         "status": "active",
         "memoria": len(MEMORIA),
-        "feedback": len(FEEDBACK_DB),
-        "historico": len(historico_desc_list)
+        "historico": len(historico_desc_list),
+        "catalogo": len(catalogo_dict)
     })
 
 if __name__ == '__main__':
