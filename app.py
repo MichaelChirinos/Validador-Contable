@@ -33,6 +33,7 @@ df_catalogo = pd.read_csv(
 )
 catalogo_dict = dict(zip(df_catalogo['AcctCode'].astype(str), df_catalogo['AcctName']))
 catalogo_nombre_a_codigo = {v: k for k, v in catalogo_dict.items()}
+codigos_validos = set(catalogo_dict.keys())
 
 def obtener_nombre_desde_codigo(codigo):
     return catalogo_dict.get(str(codigo))
@@ -43,8 +44,7 @@ def obtener_codigo_desde_nombre(nombre):
 def es_codigo_valido(codigo):
     if not codigo:
         return False
-    codigo_str = str(codigo).strip()
-    return bool(re.match(r'^\d{4,6}$', codigo_str))
+    return str(codigo) in codigos_validos
 
 # --- CARGA DEL HISTÓRICO ---
 df_historico = pd.read_csv(
@@ -62,7 +62,7 @@ desc_to_acct = dict(zip(df_historico['Dscription'].str.lower(), df_historico['Ac
 MEMORIA = cargar_memoria()
 print(f"📚 Memoria: {len(MEMORIA)} patrones")
 print(f"📊 Histórico: {len(historico_desc_list)} registros")
-print(f"📋 Catálogo: {len(catalogo_dict)} cuentas")
+print(f"📋 Catálogo: {len(codigos_validos)} cuentas válidas")
 
 def extraer_patron(desc):
     if not desc:
@@ -116,7 +116,7 @@ def auditar():
                     "confianza": 0.9
                 })
         
-        # --- 2. Usar IA de Groq ---
+        # --- 2. Usar IA ---
         contexto = buscar_contexto_historico(desc_f)
         
         prompt = f"""Eres un auditor contable. Analiza esta factura:
@@ -127,10 +127,10 @@ CUENTA ACTUAL: {codigo_actual} - {nombre_actual}
 CONTEXTO HISTÓRICO:
 {contexto}
 
-REGLAS:
-- Si la cuenta actual es razonable, es_correcta = true
-- Si no, sugiere la cuenta correcta (solo códigos numéricos de 4-6 dígitos)
-- El código sugerido DEBE ser numérico, no texto
+REGLAS IMPORTANTES:
+- SOLO usa códigos que existan en el catálogo (códigos numéricos de 4-6 dígitos)
+- NO inventes códigos nuevos
+- Si no estás seguro, sugiere mantener el código actual
 
 RESPONDE SOLO JSON:
 {{"es_correcta": bool, "codigo_sugerido": "string", "nombre_sugerido": "string", "justificacion": "string"}}"""
@@ -145,36 +145,38 @@ RESPONDE SOLO JSON:
         
         resultado = json.loads(res.choices[0].message.content)
         
-        # --- 3. CORRECCIÓN DE FALSOS POSITIVOS ---
-        nombre_sugerido = resultado.get('nombre_sugerido', '')
+        # --- 3. VALIDAR QUE EL CÓDIGO SUGERIDO EXISTA EN EL CATÁLOGO ---
         codigo_sugerido = str(resultado.get('codigo_sugerido', ''))
+        nombre_sugerido = resultado.get('nombre_sugerido', '')
         
-        # Calcular similitud entre nombres
-        similitud = fuzz.ratio(nombre_sugerido.lower(), nombre_actual.lower())
+        # Verificar si el código existe en el catálogo
+        if not es_codigo_valido(codigo_sugerido):
+            # El código no existe, buscar por nombre
+            codigo_por_nombre = obtener_codigo_desde_nombre(nombre_sugerido)
+            
+            if codigo_por_nombre:
+                resultado['codigo_sugerido'] = codigo_por_nombre
+                resultado['justificacion'] = f"🔍 '{codigo_sugerido}' no existe, se usó {codigo_por_nombre}"
+            else:
+                # No existe ni el código ni el nombre, usar el actual
+                resultado['codigo_sugerido'] = codigo_actual
+                resultado['nombre_sugerido'] = nombre_actual
+                resultado['es_correcta'] = True
+                resultado['justificacion'] = f"⚠️ Código inválido. Se mantiene {codigo_actual}"
         
-        # Si los nombres son muy similares (>75%), priorizar el código actual
+        # --- 4. CORRECCIÓN DE FALSOS POSITIVOS ---
+        similitud = fuzz.ratio(resultado.get('nombre_sugerido', '').lower(), nombre_actual.lower())
+        
         if similitud > 75:
             resultado['codigo_sugerido'] = codigo_actual
             resultado['nombre_sugerido'] = nombre_actual
             resultado['es_correcta'] = True
-            resultado['justificacion'] = f"✓ Nombre coincide ({similitud}%): se mantiene {codigo_actual}"
-        
-        # Si el código sugerido es texto (ej: "SEGUROS"), convertirlo a código real
-        elif not es_codigo_valido(codigo_sugerido) and nombre_sugerido:
-            codigo_real = obtener_codigo_desde_nombre(nombre_sugerido)
-            if codigo_real:
-                resultado['codigo_sugerido'] = codigo_real
-        
-        # Si no hay código válido, usar el actual
-        if not es_codigo_valido(resultado.get('codigo_sugerido', '')):
-            resultado['codigo_sugerido'] = codigo_actual
-            resultado['nombre_sugerido'] = nombre_actual
         
         # Si el código sugerido es igual al actual, forzar true
-        if resultado['codigo_sugerido'] == codigo_actual:
+        if resultado.get('codigo_sugerido') == codigo_actual:
             resultado['es_correcta'] = True
         
-        # --- 4. APRENDER ---
+        # --- 5. APRENDER ---
         if patron:
             if patron not in MEMORIA:
                 MEMORIA[patron] = {
@@ -205,9 +207,10 @@ def feedback():
         desc_f = data.get('descripcion', '')
         codigo_correcto = data.get('codigo_correcto', '')
         
+        if not es_codigo_valido(codigo_correcto):
+            return jsonify({"error": f"El código {codigo_correcto} no existe en el catálogo"}), 400
+        
         nombre_real = obtener_nombre_desde_codigo(codigo_correcto)
-        if not nombre_real:
-            return jsonify({"error": "Código no existe en catálogo"}), 400
         
         patron = extraer_patron(desc_f)
         if patron:
@@ -236,7 +239,7 @@ def health():
         "status": "active",
         "memoria": len(MEMORIA),
         "historico": len(historico_desc_list),
-        "catalogo": len(catalogo_dict)
+        "catalogo": len(codigos_validos)
     })
 
 @app.route('/')
