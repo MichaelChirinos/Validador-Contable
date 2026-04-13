@@ -10,7 +10,7 @@ from datetime import datetime
 app = Flask(__name__)
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# --- MEMORIA PERSISTENTE (aprende de la IA) ---
+# --- MEMORIA PERSISTENTE ---
 MEMORIA_ARCHIVO = 'memoria.json'
 
 def cargar_memoria():
@@ -32,6 +32,23 @@ df_catalogo = pd.read_csv(
     on_bad_lines='skip'
 )
 catalogo_dict = dict(zip(df_catalogo['AcctCode'].astype(str), df_catalogo['AcctName']))
+catalogo_nombre_a_codigo = {v: k for k, v in catalogo_dict.items()}
+
+def obtener_codigo_desde_nombre(nombre):
+    """Convierte un nombre de cuenta a su código"""
+    if not nombre:
+        return None
+    return catalogo_nombre_a_codigo.get(nombre)
+
+def obtener_nombre_desde_codigo(codigo):
+    return catalogo_dict.get(str(codigo))
+
+def es_codigo_valido(codigo):
+    """Verifica si el código es numérico de 4-6 dígitos"""
+    if not codigo:
+        return False
+    codigo_str = str(codigo).strip()
+    return bool(re.match(r'^\d{4,6}$', codigo_str))
 
 # --- CARGA DEL HISTÓRICO ---
 df_historico = pd.read_csv(
@@ -47,11 +64,10 @@ historico_desc_list = df_historico['Dscription'].tolist()
 desc_to_acct = dict(zip(df_historico['Dscription'].str.lower(), df_historico['AcctName']))
 
 MEMORIA = cargar_memoria()
-print(f"📚 Memoria: {len(MEMORIA)} patrones aprendidos")
+print(f"📚 Memoria: {len(MEMORIA)} patrones")
 print(f"📊 Histórico: {len(historico_desc_list)} registros")
 
 def extraer_patron(desc):
-    """Extrae patrón general de la descripción"""
     desc = desc.lower()
     desc = re.sub(r'dcc\s*\d+\s*-?\s*', '', desc)
     desc = re.sub(r'[a-z]+\s+[a-z]+\s+[a-z]+', '', desc)
@@ -61,7 +77,6 @@ def extraer_patron(desc):
     return ' '.join(palabras[:3])
 
 def buscar_contexto_historico(descripcion):
-    """Busca contexto en histórico para darle a la IA"""
     matches = process.extract(descripcion, historico_desc_list, limit=3, scorer=fuzz.token_set_ratio)
     contexto = []
     for val, score in matches:
@@ -80,8 +95,9 @@ def auditar():
         codigo_actual = str(cuenta_actual.get('AcctCode', ''))
         nombre_actual = cuenta_actual.get('AcctName', '')
         
-        # --- 1. Buscar en MEMORIA (aprendizaje previo) ---
         patron = extraer_patron(desc_f)
+        
+        # --- 1. Buscar en MEMORIA ---
         if patron in MEMORIA:
             recordado = MEMORIA[patron]
             if recordado['codigo'] != codigo_actual:
@@ -101,25 +117,24 @@ def auditar():
                     "confianza": 0.9
                 })
         
-        # --- 2. Usar IA de Groq para analizar ---
+        # --- 2. Usar IA ---
         contexto = buscar_contexto_historico(desc_f)
         
-        prompt = f"""Eres un auditor contable senior. Analiza esta factura:
+        prompt = f"""Eres un auditor contable. Analiza esta factura:
 
 DESCRIPCIÓN: "{desc_f[:150]}"
 CUENTA ACTUAL: {codigo_actual} - {nombre_actual}
 
-CONTEXTO HISTÓRICO (referencias similares):
+CONTEXTO HISTÓRICO:
 {contexto}
 
 REGLAS:
-- Usa el contexto histórico como guía, pero no como regla absoluta
-- Si la cuenta actual es razonable para la descripción, marca es_correcta = true
-- Si no, sugiere la cuenta correcta basada en tu conocimiento contable
-- Sé CONSISTENTE: productos similares deben tener la misma cuenta
+- Si la cuenta actual es razonable, es_correcta = true
+- Si no, sugiere la cuenta correcta (solo códigos numéricos de 4-6 dígitos)
+- El código sugerido DEBE ser numérico, no texto
 
-RESPONDE SOLO EN JSON:
-{{"es_correcta": true/false, "codigo_sugerido": "string", "nombre_sugerido": "string", "justificacion": "string"}}"""
+RESPONDE SOLO JSON:
+{{"es_correcta": bool, "codigo_sugerido": "string (solo números)", "nombre_sugerido": "string", "justificacion": "string"}}"""
 
         res = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -131,34 +146,54 @@ RESPONDE SOLO EN JSON:
         
         resultado = json.loads(res.choices[0].message.content)
         
-        # --- 3. APRENDER de la decisión de la IA ---
+        # --- 3. CORREGIR RESPUESTAS INCORRECTAS ---
+        codigo_sugerido = resultado.get('codigo_sugerido', '')
+        nombre_sugerido = resultado.get('nombre_sugerido', '')
+        
+        # Si el código sugerido es texto (ej: "SEGUROS DE PERSONAL"), convertirlo
+        if not es_codigo_valido(codigo_sugerido) and nombre_sugerido:
+            codigo_correcto = obtener_codigo_desde_nombre(nombre_sugerido)
+            if codigo_correcto:
+                codigo_sugerido = codigo_correcto
+                resultado['codigo_sugerido'] = codigo_correcto
+        
+        # Si no hay código sugerido, usar el actual
+        if not es_codigo_valido(codigo_sugerido):
+            codigo_sugerido = codigo_actual
+            nombre_sugerido = nombre_actual
+            resultado['codigo_sugerido'] = codigo_actual
+            resultado['nombre_sugerido'] = nombre_actual
+        
+        # Si el código sugerido es igual al actual, debe ser true
+        if codigo_sugerido == codigo_actual:
+            resultado['es_correcta'] = True
+        
+        # --- 4. APRENDER ---
         if patron:
             if patron not in MEMORIA:
                 MEMORIA[patron] = {
-                    'codigo': resultado.get('codigo_sugerido', codigo_actual),
-                    'nombre': resultado.get('nombre_sugerido', nombre_actual),
+                    'codigo': codigo_sugerido,
+                    'nombre': nombre_sugerido,
                     'veces': 1
                 }
             else:
                 MEMORIA[patron]['veces'] += 1
             guardar_memoria(MEMORIA)
-            print(f"📚 Aprendido: '{patron}' → {MEMORIA[patron]['codigo']} (veces: {MEMORIA[patron]['veces']})")
         
         return jsonify(resultado)
     
     except Exception as e:
         print(f"Error: {e}")
-        return jsonify({"error": str(e), "es_correcta": False}), 500
+        return jsonify({"error": str(e), "es_correcta": False, "codigo_sugerido": codigo_actual, "nombre_sugerido": nombre_actual}), 500
 
 @app.route('/feedback', methods=['POST'])
 def feedback():
-    """Corrección manual para casos donde la IA falla"""
     try:
         data = request.json
         desc_f = data.get('descripcion', '')
         codigo_correcto = data.get('codigo_correcto', '')
         
-        nombre_real = catalogo_dict.get(str(codigo_correcto))
+        nombre_real = obtener_nombre_desde_codigo(codigo_correcto)
         if not nombre_real:
             return jsonify({"error": "Código no existe"}), 400
         
@@ -166,13 +201,11 @@ def feedback():
         MEMORIA[patron] = {
             'codigo': codigo_correcto,
             'nombre': nombre_real,
-            'veces': MEMORIA.get(patron, {}).get('veces', 0) + 1,
-            'feedback': True
+            'veces': MEMORIA.get(patron, {}).get('veces', 0) + 1
         }
         guardar_memoria(MEMORIA)
         
-        print(f"📝 Feedback: '{patron}' → {codigo_correcto}")
-        return jsonify({"status": "✅ Corregido y aprendido"})
+        return jsonify({"status": "✅ Aprendido"})
     
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -189,8 +222,7 @@ def health():
     return jsonify({
         "status": "active",
         "memoria": len(MEMORIA),
-        "historico": len(historico_desc_list),
-        "catalogo": len(catalogo_dict)
+        "historico": len(historico_desc_list)
     })
 
 if __name__ == '__main__':
